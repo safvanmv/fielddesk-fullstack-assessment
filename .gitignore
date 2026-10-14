@@ -5,15 +5,23 @@
 
 # Dependencies
 node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
 
 # Build and test output
 dist/
 build/
 coverage/
 .next/
+.mypy_cache/
 
 # Runtime data
 uploads/
+backend/staticfiles/
 *.log
 
 # Editors and operating systems
@@ -21,3 +29,4 @@ uploads/
 .vscode/
 .DS_Store
 Thumbs.db
+backend/media/

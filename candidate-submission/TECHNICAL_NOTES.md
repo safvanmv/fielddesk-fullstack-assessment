@@ -5,68 +5,150 @@ Complete this document as part of the submission.
 ## Candidate
 
 - Name:
-- GitHub username:
-- Final commit SHA:
-- Screen-recording link:
+- GitHub username: safvanmv
+- Final commit SHA: listed in the pull request description
+- Screen-recording link: https://drive.google.com/file/d/1zfeeqIK5c2Ihc_7ii6BgHNClQyJc7O60/view?usp=sharing
 
 ## Local setup
 
-Document the exact commands required to configure and start the application.
+```sh
+cp .env.example .env              # Windows cmd: copy .env.example .env
+docker compose up --build -d
+docker compose exec api python manage.py seed_assessment
+```
+
+- Frontend: http://localhost:5173
+- API: http://localhost:8000/api/ (health: `/api/health/`, readiness: `/api/ready/`)
+- Migrations run automatically when the API starts.
+- Stop: `docker compose down` (add `--volumes` to delete the database).
 
 ## Sample accounts
 
-List the seeded organisations, roles and sample login credentials. Use assessment-only credentials.
+Password for every account: `FieldDesk!2026` (local only; change it with `SEED_PASSWORD`).
+
+| Organisation | Owner | Dispatcher | Technician |
+| --- | --- | --- | --- |
+| Northstar Maintenance | `northstar_owner` | `northstar_dispatcher` | `northstar_technician` |
+| Harbor Services | `harbor_owner` | `harbor_dispatcher` | `harbor_technician` |
 
 ## Verification results
 
 | Check | Command | Result |
 | --- | --- | --- |
-| Backend tests |  |  |
-| Frontend tests |  |  |
-| Integration tests |  |  |
-| Lint |  |  |
-| Build |  |  |
+| Backend tests | `docker compose exec api python manage.py test apps` | Passed: 38 tests, against PostgreSQL |
+| Frontend tests | `npm --prefix frontend test` | Passed: 9 tests |
+| Integration tests | API tests against real PostgreSQL (included above), plus a headless-browser run of the full stack | Passed: 29/29 browser steps |
+| Lint | `npm --prefix frontend run lint` | Passed: no errors |
+| Build | `npm --prefix frontend run build` | Passed |
 
 ## Architecture
 
-Describe the major components, their responsibilities and important dependencies.
+- **Frontend** (`frontend/`): React + TypeScript (Vite). It calls the API through the `/api` proxy using session cookies.
+- **API** (`backend/`): Django REST Framework, split into apps:
+  - `accounts`: organisations, roles, login, user management
+  - `work_orders`: work orders, scheduling, progress events, attachments, CSV export
+  - `notifications`: Celery notification task and mock provider
+  - `activity`: audit log and real-time stream
+  - `common`: error format, request IDs, logging, health checks
+- **Worker:** Celery, built from the same image but running as a separate process.
+- **PostgreSQL** stores all data. **Redis** is the Celery broker and the rate-limit cache.
+- Business rules live in service modules; views only handle HTTP.
 
 ## Database design
 
-Explain the principal tables, relationships, constraints, indexes and migration strategy.
+- **Tables:** `Organization`, `Membership` (one per user, holds the role), `WorkOrder`, `Attachment`, `ProgressEvent`, `AuditLog`, `RealtimeEvent`, `NotificationDelivery`, `NotificationReceipt`.
+- **Constraints:**
+  - unique `(organization, reference)`
+  - start before end, both set or both empty
+  - exclusion constraint (`btree_gist`): one technician can't have overlapping active work orders
+  - unique `(organization, event_id)` for progress events
+  - unique `(work_order, assignment_revision)` for notifications
+- **Indexes:**
+  - work orders on `(organization, status, scheduled_start)` and `(organization, priority)`
+  - audit on `(organization, created_at)`
+  - real-time events on `(organization, id)`
+  - memberships on `(organization, role)`
+- **Migrations:** Django migrations per app, applied when the API starts.
+- Work orders, attachments and events reference users with `PROTECT`, so users are deactivated, not deleted.
 
 ## Authentication, roles and organisation isolation
 
-Explain how authentication works and where organisation and role restrictions are enforced.
+- **Sessions:** Django session login. The cookie is HttpOnly, every write needs a CSRF token, passwords are hashed, and logins are rate-limited.
+- **Organisation and role** always come from the user's `Membership` on the server, never from the request.
+- **Enforcement is in the backend:**
+  - permission classes (`OwnerOnly` for user management, a role check for work-order changes)
+  - organisation-scoped querysets (`work_orders/selectors.py`): technicians only see work assigned to them
+  - another organisation's records return 404
+- The frontend hides actions a role can't use, but it isn't relied on for security.
 
 ## Transactions, idempotency and concurrency
 
-Explain the transaction boundaries, duplicate-event handling and concurrent scheduling protection.
+- **Scheduling:** the PostgreSQL exclusion constraint blocks double-booking and returns 409.
+  - If two overlapping requests deadlock, the losing one is retried once and also gets 409.
+  - Safe with several API instances, because the database enforces it.
+- **Progress events:** validated first, then one transaction locks the work order, inserts the event, updates the status and writes the audit entry. All of it is saved, or none of it.
+- **Duplicate events:** a repeated `eventId` returns `200 {"duplicate": true}` and is applied only once, including when the copies arrive at the same time.
+- **References:** random `FD-XXXXXXXX` codes generated by the server; the unique constraint plus a retry prevents duplicates.
+- **User changes** lock the organisation row and re-check that the acting owner is still an owner.
 
 ## Background jobs
 
-Explain delivery guarantees, retries, backoff, duplicate prevention and permanent failure handling.
+- When a technician is assigned or changed, a notification job is queued **after the database commit**.
+- **No duplicates:** one delivery record per assignment. The record is locked while sending, and the provider receives an idempotency key.
+- **Temporary failure:** retried with backoff (2, 4, 8 and 16 s), up to 5 attempts, then marked `failed`.
+- **Permanent failure:** marked `failed` straight away, with no retries.
+- **Recording:** attempts, outcome and the last error are stored, written to the audit log, and logged as JSON.
+- **Mock provider mode:** `NOTIFICATION_PROVIDER_MODE` = `success`, `temporary` or `permanent`.
 
 ## Real-time updates
 
-Explain connection authentication, organisation isolation, reconnection and degraded behaviour.
+- Server-Sent Events at `/api/events/stream/`, authenticated by the session cookie.
+- Only events from the user's own organisation are sent.
+- **Reconnecting:** each event has an ID, the browser reconnects with `Last-Event-ID`, and the stream closes about every 25 s to keep connections fresh.
+- **If the stream is down:** the dashboard refreshes every 30 s and the rest of the app works normally.
 
 ## File security and storage limits
 
-Explain validation, authorisation, quota enforcement and the production object-storage approach.
+- **Allowed types:** PDF, JPEG, PNG, GIF and WebP only, checked by the file's actual content. Maximum 10 MB per file (`ATTACHMENT_MAX_BYTES`).
+- **Storage names:** files are stored under random names; the original name is only displayed. No file paths are returned by the API.
+- **Access:** limited to the file's organisation; technicians can only reach their assigned work orders. Only owners and dispatchers can upload.
+- **Quota:** a storage limit per organisation, checked while the organisation row is locked.
+- **Production:** private object storage (e.g. S3) with short-lived signed download links issued after the same permission check, plus malware scanning.
 
 ## Security considerations
 
-Describe relevant threats considered and the protections implemented.
+- **Cross-organisation access:** all queries are scoped to the user's organisation; changing IDs returns 404.
+- **Privilege escalation:** server-side permissions; the owner is re-checked when users are changed.
+- **CSRF and session theft:** CSRF token on writes; HttpOnly, SameSite=Lax cookies.
+- **Brute force:** login rate limit and the same error for unknown users and wrong passwords.
+- **Malicious files:** content check, random names, served as downloads.
+- **CSV formula injection:** risky cells are escaped.
+- **Audit tampering:** there is no API to edit or delete audit entries.
+- **Secrets:** environment variables; `.env` is not committed.
 
 ## Production deployment and operations
 
-Explain how you would deploy, scale, monitor, back up and recover the application.
+- **Deploy:** a production server (gunicorn or uvicorn) behind a TLS load balancer; managed PostgreSQL and Redis; object storage.
+- **Scale:** add API and worker instances. Correctness rules are in the database, so they hold across instances. At larger scale, move real-time events to Redis pub/sub.
+- **Monitor:** collect the JSON logs with request IDs centrally; alert on 5xx errors, failed notifications and queue backlog; point health and readiness probes at `/api/health/` and `/api/ready/`.
+- **Backup and recovery:** PostgreSQL point-in-time recovery, versioned object storage, and regular restore tests.
 
 ## Assumptions and trade-offs
 
-List significant assumptions and explain important trade-offs.
+- **Backend framework:** Django REST Framework instead of Node.js/TypeScript, approved by Gatlier.
+- **Session cookies instead of tokens:** same-origin app, and no tokens stored in the browser.
+- **Random references instead of a sequential counter:** no lock needed, so creates never wait on each other.
+- **SSE polling the database instead of a message broker:** simpler, and enough at this scale.
+- **Deactivating users instead of deleting them:** keeps work-order and audit history intact.
+- **Local file storage** for the assessment; object storage in production.
 
 ## Known limitations or incomplete requirements
 
-List anything incomplete or not working. If none, state that explicitly.
+- **Graceful shutdown** isn't set up: Compose runs Django's development server.
+- **No outbox for notifications:** if Redis is down when a work order is saved, the job is only logged, not queued.
+- **Status transitions aren't restricted:** for example, a completed job can be moved back to in progress.
+- **Progress events:** timestamps aren't checked for plausibility, and a reused `eventId` with a different payload is treated as a duplicate.
+- **Malformed filters:** some, such as a non-numeric `technician`, return 500 instead of 400.
+- **Login rate limit** is per IP, so users behind the same proxy share it.
+- **Accounts:** no password reset
+- **Not production-ready:** no object storage, malware scanning, real notification provider
